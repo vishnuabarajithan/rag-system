@@ -21,6 +21,7 @@ def run(state: AgentState) -> dict:
             query_text=query,
             top_k=settings.retriever_top_k,
             filters=state.get("query_filters", {}),
+            filenames=state.get("source_filenames") or None,
         )
         for r in results:
             if r["chunk_id"] not in seen_ids:

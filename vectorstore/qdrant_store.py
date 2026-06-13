@@ -3,6 +3,7 @@ from qdrant_client.models import (
     Filter,
     FieldCondition,
     MatchValue,
+    MatchAny,
     SparseVector,
     PointStruct,
     Prefetch,
@@ -48,19 +49,25 @@ class QdrantStore:
         query_text: str,
         top_k: int = 20,
         filters: dict | None = None,
+        filenames: list[str] | None = None,
     ) -> list[dict]:
         ensure_collection(self._client, collection)
 
         from vectorstore.sparse_index import bm25_encode
         sparse_indices, sparse_values = bm25_encode(query_text)
 
-        qdrant_filter = None
+        conditions = []
         if filters:
-            conditions = [
+            conditions += [
                 FieldCondition(key=k, match=MatchValue(value=v))
                 for k, v in filters.items()
             ]
-            qdrant_filter = Filter(must=conditions)
+        if filenames:
+            # Restrict retrieval to a set of source files (checkbox include/exclude).
+            conditions.append(
+                FieldCondition(key="filename", match=MatchAny(any=filenames))
+            )
+        qdrant_filter = Filter(must=conditions) if conditions else None
 
         results = self._client.query_points(
             collection_name=collection,
@@ -116,6 +123,13 @@ class QdrantStore:
             for p in points
         ]
         self._client.upsert(collection_name=collection, points=qdrant_points)
+
+    def drop_collection(self, collection: str) -> None:
+        """Delete an entire collection (used to reset a session). No-op if absent."""
+        try:
+            self._client.delete_collection(collection_name=collection)
+        except Exception:
+            pass
 
     def delete_by_filename(self, collection: str, filename: str) -> None:
         from qdrant_client.models import FilterSelector

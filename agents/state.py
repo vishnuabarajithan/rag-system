@@ -18,6 +18,7 @@ class AgentState(TypedDict):
     user_query: str
     session_id: str
     collection_names: list[str]
+    source_filenames: list[str]   # restrict retrieval to these source files (optional)
 
     # ── Query understanding ─────────────────────────────────────────────────
     expanded_queries: list[str]
