@@ -19,6 +19,7 @@ env/
 # ── Local data / runtime artifacts ──────────────────────────────────
 qdrant_local/
 mlruns/
+mlartifacts/
 mlflow.db
 *.sqlite3
 

@@ -25,6 +25,16 @@ python chat.py                    # CLI: skip ingest, query what's already store
 
 The full HTTP API stack (real Qdrant server, Redis, MLflow, Celery) needs Docker, which is **not installed** on this machine — `docker compose up --build` won't run without installing Docker Desktop first. API would serve Swagger at `:8000/docs`, MLflow at `:5000`.
 
+### MLflow monitoring (works locally, no Docker)
+
+Every `webapp.py` `/ask` (and the API `/query`) is traced via `monitoring/mlflow_tracer.py` — `get_tracer()` returns a `RAGTracer` that logs per query: token counts (`input/output/total_tokens`), `total_latency_ms`, retrieval/rerank scores + chunk counts, `confidence_score`, `num_citations`, and the answer/citations as artifacts. Locally the tracking store defaults to a SQLite file (`MLFLOW_TRACKING_URI=sqlite:///mlflow.db`), so no server is needed. To view the dashboard, run from the **project root** in a second terminal:
+
+```bash
+.venv\Scripts\python.exe -m mlflow ui --backend-store-uri sqlite:///mlflow.db --port 5000   # → http://localhost:5000
+```
+
+Both the app and the UI must use the same `sqlite:///mlflow.db` and run from the project root (relative path). Monitoring is **crash-proof and lazy**: it never connects at import, every MLflow call is exception-swallowed, and if the backend is unreachable or `MLFLOW_ENABLED=false`, `get_tracer()` falls back to a `NoopTracer` so the chat is unaffected. Per-node latency is *not* captured (only whole-graph `graph_invoke`).
+
 ## Architecture
 
 A document QA system: a **LangGraph** agent answers questions grounded in ingested documents, using hybrid retrieval + cross-encoder reranking + **Google Gemini** generation. There are two execution paths that share the same core (`ingestion/`, `vectorstore/`, `agents/`):

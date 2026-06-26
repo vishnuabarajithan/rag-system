@@ -38,6 +38,7 @@ from ingestion.pipeline import IngestionPipeline
 from agents.rag_agent import rag_graph
 from vectorstore.qdrant_store import QdrantStore
 from web.sessions import get_session_store, collection_for
+from monitoring.mlflow_tracer import get_tracer
 
 _pipeline = IngestionPipeline()
 _store = QdrantStore()
@@ -298,6 +299,8 @@ def assistant_bubble(text, citations, meta):
             bits.append(f"retrieval: {meta['retrieval']}")
         if meta.get("confidence") is not None:
             bits.append(f"confidence: {meta['confidence']:.2f}")
+        if meta.get("tokens"):
+            bits.append(f"tokens: {meta['tokens']}")
         if bits:
             meta_line = Div("  ·  ".join(bits), cls="meta")
 
@@ -439,22 +442,33 @@ def ask(session, question: str):
         _sessions.save(sid, state)
         return user_bubble(question), assistant_bubble(warn, [], {})
 
+    tracer = get_tracer(question, sid)
     try:
-        result = rag_graph.invoke({
-            "user_query":       question,
-            "session_id":       sid,
-            "collection_names": [collection],
-            "source_filenames": selected,
-            "iteration_count":  0,
-            "messages":         [],
-        })
-        answer = result.get("final_answer") or "I couldn't generate an answer for that."
-        citations = result.get("citations", [])
-        meta = {
-            "intent":     result.get("query_intent"),
-            "retrieval":  result.get("retrieval_quality"),
-            "confidence": result.get("confidence_score"),
-        }
+        with tracer.start_run():
+            with tracer.stage("graph_invoke"):
+                result = rag_graph.invoke({
+                    "user_query":       question,
+                    "session_id":       sid,
+                    "collection_names": [collection],
+                    "source_filenames": selected,
+                    "iteration_count":  0,
+                    "messages":         [],
+                })
+            answer = result.get("final_answer") or "I couldn't generate an answer for that."
+            citations = result.get("citations", [])
+            in_tok = result.get("input_tokens", 0) or 0
+            out_tok = result.get("output_tokens", 0) or 0
+            meta = {
+                "intent":     result.get("query_intent"),
+                "retrieval":  result.get("retrieval_quality"),
+                "confidence": result.get("confidence_score"),
+                "tokens":     (in_tok + out_tok) or None,
+            }
+            tracer.log_query_analysis(result)
+            tracer.log_retrieval(result.get("raw_chunks", []), result.get("retrieval_quality", ""))
+            tracer.log_reranking(result.get("reranked_chunks", []))
+            tracer.log_generation(in_tok, out_tok, result.get("confidence_score", 0.0))
+            tracer.log_final_answer(answer, citations)
     except Exception as exc:
         answer, citations, meta = f"Something went wrong: {exc}", [], {}
 

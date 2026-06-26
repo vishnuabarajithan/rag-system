@@ -21,8 +21,12 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379"
 
     # MLflow
-    mlflow_tracking_uri: str = "http://localhost:5000"
+    # Local default: a SQLite file in the project root — works with no server
+    # and no Docker. View it with: mlflow ui --backend-store-uri sqlite:///mlflow.db
+    # In Docker, this is overridden to the MLflow server (http://mlflow:5000).
+    mlflow_tracking_uri: str = "sqlite:///mlflow.db"
     mlflow_experiment_name: str = "rag-system"
+    mlflow_enabled: bool = True
 
     # Embeddings
     # "gemini" uses the Gemini API (no local model, no GPU); "local" uses a

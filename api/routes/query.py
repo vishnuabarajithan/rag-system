@@ -4,7 +4,7 @@ from pydantic import BaseModel
 
 from agents.rag_agent import rag_graph
 from cache.semantic_cache import SemanticCache
-from monitoring.mlflow_tracer import RAGTracer
+from monitoring.mlflow_tracer import get_tracer
 
 router = APIRouter(prefix="/query", tags=["query"])
 _cache = SemanticCache()
@@ -28,7 +28,7 @@ class QueryResponse(BaseModel):
 @router.post("/", response_model=QueryResponse)
 async def query(req: QueryRequest):
     session_id = req.session_id or str(uuid.uuid4())
-    tracer = RAGTracer(query=req.question, session_id=session_id)
+    tracer = get_tracer(query=req.question, session_id=session_id)
 
     with tracer.start_run():
         # Semantic cache check
