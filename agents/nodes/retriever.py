@@ -1,9 +1,9 @@
 from agents.state import AgentState, RetrievedChunk
 from vectorstore.qdrant_store import QdrantStore
-from ingestion.embedders.text_embedder import TextEmbedder
+from ingestion.embedders import get_embedder
 from config.settings import settings
 
-_embedder = TextEmbedder()
+_embedder = get_embedder()
 _store = QdrantStore()
 
 

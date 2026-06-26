@@ -16,7 +16,7 @@ from ingestion.loaders.spreadsheet_loader import SpreadsheetLoader
 from ingestion.loaders.database_loader import DatabaseLoader
 from ingestion.loaders.image_loader import ImageLoader
 from ingestion.chunkers.semantic_chunker import ChunkingPipeline
-from ingestion.embedders.text_embedder import TextEmbedder
+from ingestion.embedders import get_embedder
 from vectorstore.qdrant_store import QdrantStore
 from vectorstore.sparse_index import bm25_encode
 
@@ -25,7 +25,7 @@ _TEXT_LOADER   = TextLoader()
 _SHEET_LOADER  = SpreadsheetLoader()
 _IMAGE_LOADER  = ImageLoader()
 _CHUNKER       = ChunkingPipeline()
-_EMBEDDER      = TextEmbedder()
+_EMBEDDER      = get_embedder()
 _STORE         = QdrantStore()
 
 _IMAGE_EXTS    = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff"}

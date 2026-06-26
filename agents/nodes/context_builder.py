@@ -39,6 +39,8 @@ def run(state: AgentState) -> dict:
 
         parts.append(block)
         total_chars += len(block)
+        raw = chunk.get("content") or ""
+        excerpt = raw[:600] + ("…" if len(raw) > 600 else "")
         citations.append({
             "ref": ref,
             "chunk_id": chunk.get("chunk_id"),
@@ -46,6 +48,7 @@ def run(state: AgentState) -> dict:
             "page_num": meta.get("page_num"),
             "sheet_name": meta.get("sheet_name"),
             "content_type": ctype,
+            "content": excerpt,
         })
 
     context = "\n\n---\n\n".join(parts)

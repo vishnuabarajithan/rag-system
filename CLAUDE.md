@@ -21,6 +21,8 @@ python chat.py path/to/doc.pdf    # CLI: ingest a doc, then loop Q&A
 python chat.py                    # CLI: skip ingest, query what's already stored
 ```
 
+`webapp.py` (FastHTML, the primary/production-intended UI) isolates each browser session: a signed-cookie `sid` maps to its own `session_<sid>` Qdrant collection, and per-session state (docs, per-source toggles, chat) lives in a `web/sessions.py` store — `InMemorySessionStore` by default (`SESSION_BACKEND=memory`), or `RedisSessionStore` (`SESSION_BACKEND=redis`) for multi-worker. For horizontally scaled production: point at a Qdrant **server** (leave `QDRANT_LOCAL_PATH` empty so `QDRANT_URL` is used — embedded Qdrant's exclusive single-process file lock forbids >1 worker), set `SESSION_BACKEND=redis` + a real `SESSION_SECRET`, and run `uvicorn webapp:app --workers N` (not the dev `serve()`).
+
 The full HTTP API stack (real Qdrant server, Redis, MLflow, Celery) needs Docker, which is **not installed** on this machine — `docker compose up --build` won't run without installing Docker Desktop first. API would serve Swagger at `:8000/docs`, MLflow at `:5000`.
 
 ## Architecture
