@@ -1,5 +1,5 @@
 # CLAUDE.md
-claude
+
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Commands
@@ -21,13 +21,11 @@ python chat.py path/to/doc.pdf    # CLI: ingest a doc, then loop Q&A
 python chat.py                    # CLI: skip ingest, query what's already stored
 ```
 
-`webapp.py` (FastHTML, the primary/production-intended UI) isolates each browser session: a signed-cookie `sid` maps to its own `session_<sid>` Qdrant collection, and per-session state (docs, per-source toggles, chat) lives in a `web/sessions.py` store — `InMemorySessionStore` by default (`SESSION_BACKEND=memory`), or `RedisSessionStore` (`SESSION_BACKEND=redis`) for multi-worker. For horizontally scaled production: point at a Qdrant **server** (leave `QDRANT_LOCAL_PATH` empty so `QDRANT_URL` is used — embedded Qdrant's exclusive single-process file lock forbids >1 worker), set `SESSION_BACKEND=redis` + a real `SESSION_SECRET`, and run `uvicorn webapp:app --workers N` (not the dev `serve()`).
-
-The full HTTP API stack (real Qdrant server, Redis, MLflow, Celery) needs Docker, which is **not installed** on this machine — `docker compose up --build` won't run without installing Docker Desktop first. API would serve Swagger at `:8000/docs`, MLflow at `:5000`.
+`webapp.py` (FastHTML) is the single UI. It isolates each browser session: a signed-cookie `sid` maps to its own `session_<sid>` Qdrant collection, and per-session state (docs, per-source toggles, chat) lives in a `web/sessions.py` store — `InMemorySessionStore` by default (`SESSION_BACKEND=memory`), or `RedisSessionStore` (`SESSION_BACKEND=redis`) for multi-worker. For horizontally scaled production: point at a Qdrant **server** (leave `QDRANT_LOCAL_PATH` empty so `QDRANT_URL` is used — embedded Qdrant's exclusive single-process file lock forbids >1 worker), set `SESSION_BACKEND=redis` + a real `SESSION_SECRET`, and run `uvicorn webapp:app --workers N` (not the dev `serve()`).
 
 ### MLflow monitoring (works locally, no Docker)
 
-Every `webapp.py` `/ask` (and the API `/query`) is traced via `monitoring/mlflow_tracer.py` — `get_tracer()` returns a `RAGTracer` that logs per query: token counts (`input/output/total_tokens`), `total_latency_ms`, retrieval/rerank scores + chunk counts, `confidence_score`, `num_citations`, and the answer/citations as artifacts. Locally the tracking store defaults to a SQLite file (`MLFLOW_TRACKING_URI=sqlite:///mlflow.db`), so no server is needed. To view the dashboard, run from the **project root** in a second terminal:
+Every `webapp.py` `/ask` is traced via `monitoring/mlflow_tracer.py` — `get_tracer()` returns a `RAGTracer` that logs per query: token counts (`input/output/total_tokens`), `total_latency_ms`, retrieval/rerank scores + chunk counts, `confidence_score`, `num_citations`, and the answer/citations as artifacts. Locally the tracking store defaults to a SQLite file (`MLFLOW_TRACKING_URI=sqlite:///mlflow.db`), so no server is needed. To view the dashboard, run from the **project root** in a second terminal:
 
 ```bash
 .venv\Scripts\python.exe -m mlflow ui --backend-store-uri sqlite:///mlflow.db --port 5000   # → http://localhost:5000
@@ -37,10 +35,12 @@ Both the app and the UI must use the same `sqlite:///mlflow.db` and run from the
 
 ## Architecture
 
-A document QA system: a **LangGraph** agent answers questions grounded in ingested documents, using hybrid retrieval + cross-encoder reranking + **Google Gemini** generation. There are two execution paths that share the same core (`ingestion/`, `vectorstore/`, `agents/`):
+A document QA system: a **LangGraph** agent answers questions grounded in ingested documents, using hybrid retrieval + cross-encoder reranking + **Google Gemini** generation. Two entry points share the same core (`ingestion/`, `vectorstore/`, `agents/`, `reranking/`, `monitoring/`):
 
-- **Local path** (`chat.py`, `webapp.py`): embedded Qdrant, synchronous ingest, no external services.
-- **Production path** (`api/`, `tasks/`): Qdrant server, Redis semantic cache, Celery async ingestion, MLflow tracing.
+- **`webapp.py`** — the FastHTML web UI (per-session collections, MLflow tracing).
+- **`chat.py`** — a CLI that ingests a doc and loops Q&A through the same graph.
+
+Both run in-process: embedded Qdrant + synchronous ingest + local SQLite MLflow, no Docker or external services required.
 
 ### Agent graph ([agents/rag_agent.py](agents/rag_agent.py))
 

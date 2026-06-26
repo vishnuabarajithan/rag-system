@@ -4,14 +4,11 @@ langgraph>=0.2.0
 langchain-core>=0.3.0
 langchain-text-splitters>=0.3.0
 
-# FastAPI
-fastapi>=0.115.0
-uvicorn[standard]>=0.32.0
-python-multipart>=0.0.12
-
-# UI
+# Web UI (FastHTML on Starlette/Uvicorn)
 python-fasthtml>=0.14.0
-markdown-it-py>=3.0.0    # render chat answers as markdown
+uvicorn[standard]>=0.32.0   # ASGI server (serve() locally, `uvicorn webapp:app` in prod)
+python-multipart>=0.0.12    # multipart form parsing for file uploads
+markdown-it-py>=3.0.0       # render chat answers as markdown
 
 # Vector DB
 qdrant-client>=1.12.0
@@ -37,9 +34,8 @@ sqlalchemy>=2.0.0
 # Monitoring
 mlflow>=2.18.0
 
-# Cache & Task Queue
+# Sessions (optional multi-worker backend for the web UI)
 redis>=5.2.0
-celery>=5.4.0
 
 # Config
 pydantic-settings>=2.6.0
