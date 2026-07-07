@@ -91,4 +91,43 @@ def build_rag_graph() -> StateGraph:
     return graph.compile()
 
 
+def build_context_graph() -> StateGraph:
+    """Same pipeline as `build_rag_graph` but stopping at `context_builder`
+    (no generation). Used by the streaming web path: it produces the context
+    window + citations, then generation is streamed token-by-token outside the
+    graph. Reuses the exact same nodes and retry routing."""
+    graph = StateGraph(AgentState)
+
+    graph.add_node("query_analyzer",  query_analyzer.run)
+    graph.add_node("retriever",       retriever.run)
+    graph.add_node("reranker",        reranker.run)
+    graph.add_node("context_builder", context_builder.run)
+
+    graph.set_entry_point("query_analyzer")
+    graph.add_edge("query_analyzer", "retriever")
+
+    graph.add_conditional_edges(
+        "retriever",
+        _route_after_retrieval,
+        {
+            "query_analyzer": "query_analyzer",
+            "retriever":      "retriever",
+            "reranker":       "reranker",
+            END:              END,
+        },
+    )
+    graph.add_conditional_edges(
+        "reranker",
+        _route_after_rerank,
+        {
+            "context_builder": "context_builder",
+            END:               END,
+        },
+    )
+    graph.add_edge("context_builder", END)
+
+    return graph.compile()
+
+
 rag_graph = build_rag_graph()
+context_graph = build_context_graph()

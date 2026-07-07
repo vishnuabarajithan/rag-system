@@ -57,3 +57,40 @@ def run(state: AgentState) -> dict:
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
     }
+
+
+def _build_user_message(state: AgentState) -> str:
+    context = state.get("context_window", "")
+    query = state["user_query"]
+    intent = state.get("query_intent", "factual")
+    hint = _INTENT_HINTS.get(intent, "")
+    return f"Context:\n{context}\n\n---\nQuestion: {query}\n{hint}"
+
+
+def stream_generate(state: AgentState, usage: dict):
+    """Stream the grounded answer token-by-token from Gemini.
+
+    Yields text deltas as they arrive. `usage` is a mutable dict that is
+    populated with `input_tokens`/`output_tokens` from the stream's usage
+    metadata (available on the final chunks). Same prompt/system instruction as
+    the non-streaming `run` above, so answers are identical in content.
+    """
+    response = _get_client().models.generate_content_stream(
+        model=settings.generation_model,
+        contents=_build_user_message(state),
+        config=types.GenerateContentConfig(
+            system_instruction=_SYSTEM,
+            max_output_tokens=4096,
+        ),
+    )
+    for chunk in response:
+        u = getattr(chunk, "usage_metadata", None)
+        if u:
+            usage["input_tokens"] = getattr(u, "prompt_token_count", 0) or usage.get("input_tokens", 0)
+            usage["output_tokens"] = getattr(u, "candidates_token_count", 0) or usage.get("output_tokens", 0)
+        try:
+            text = chunk.text
+        except Exception:
+            text = None
+        if text:
+            yield text

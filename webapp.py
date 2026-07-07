@@ -35,7 +35,8 @@ from fasthtml.common import *
 
 from config.settings import settings
 from ingestion.pipeline import IngestionPipeline
-from agents.rag_agent import rag_graph
+from agents.rag_agent import context_graph
+from agents.nodes.generator import stream_generate
 from vectorstore.qdrant_store import QdrantStore
 from web.sessions import get_session_store, collection_for
 from monitoring.mlflow_tracer import get_tracer
@@ -199,6 +200,8 @@ app, rt = fast_app(
         Link(rel="preconnect", href="https://fonts.googleapis.com"),
         Link(rel="stylesheet",
              href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Press+Start+2P&display=swap"),
+        # HTMX Server-Sent Events extension — drives token-by-token answer streaming.
+        Script(src="https://cdn.jsdelivr.net/npm/htmx-ext-sse@2.2.3/dist/sse.js"),
         Style(CSS),
     ),
 )
@@ -310,6 +313,28 @@ def assistant_bubble(text, citations, meta):
     )
 
 
+def stream_shell(mid: str):
+    """Placeholder assistant row that opens an SSE connection and streams the
+    answer into itself. `token` events replace the inner content with the
+    markdown rendered so far; the final `done` event swaps the whole row for the
+    finished bubble (with citations + meta) and closes the connection."""
+    return Div(  # transparent SSE-connection wrapper (display:contents → no layout)
+        Div(  # the .row that the final `done` event replaces wholesale
+            Div(
+                Div(
+                    Span(cls="dots"),
+                    id=f"stream-{mid}", sse_swap="token", hx_swap="innerHTML",
+                ),
+                cls="bubble assistant",
+            ),
+            cls="row assistant",
+            sse_swap="done", hx_swap="outerHTML",
+        ),
+        id=f"asst-{mid}", style="display:contents",
+        hx_ext="sse", sse_connect="/stream", sse_close="done",
+    )
+
+
 def render_message(m):
     if m["role"] == "user":
         return user_bubble(m["text"])
@@ -322,7 +347,6 @@ def composer():
               autocomplete="off", required=True, cls="q-input"),
         Button("Send", cls="btn", type="submit"),
         hx_post="/ask", hx_target="#messages", hx_swap="beforeend",
-        hx_indicator="#thinking", hx_disabled_elt="button",
         **{"hx-on::after-request": "if(event.detail.successful) this.reset()"},
         cls="composer",
     )
@@ -344,14 +368,14 @@ def index(session):
             Form(
                 Input(type="file", name="file", required=True, multiple=True,
                       accept=".pdf,.txt,.md,.csv,.xlsx,.xls,.png,.jpg,.jpeg"),
-                Button("Upload & index", cls="btn", type="submit"),
+                Button("Upload", cls="btn", type="submit"),
                 hx_post="/upload", hx_target="#docs-inner", hx_swap="outerHTML",
                 hx_encoding="multipart/form-data", hx_disabled_elt="button",
                 cls="upload-form",
             ),
             Button("↺  Reset session", cls="btn btn-ghost",
                    hx_post="/reset", hx_confirm="Delete all documents and start fresh?"),
-            Div("Supported: PDF, TXT, MD, CSV, XLSX, images. "
+            Div("Supported: PDF, TXT, MD, XLSX, images. "
                 "Everything runs locally; answers come from Gemini grounded in your files.",
                 cls="hint"),
             cls="sidebar",
@@ -367,8 +391,10 @@ def index(session):
         ),
         cls="app",
     ), Script(
-        "document.body.addEventListener('htmx:afterSwap', function(){"
-        "var m=document.getElementById('messages'); if(m) m.scrollTop=m.scrollHeight;});"
+        "function _scrollMsgs(){var m=document.getElementById('messages');"
+        "if(m) m.scrollTop=m.scrollHeight;}"
+        "document.body.addEventListener('htmx:afterSwap', _scrollMsgs);"
+        "document.body.addEventListener('htmx:sseMessage', _scrollMsgs);"
     )
 
 
@@ -401,10 +427,8 @@ async def upload(session, file: list[UploadFile]):
 
     if not indexed:
         return docs_inner(state, "Nothing new to index (duplicates or empty).", ok=False)
-    msg = f"Indexed {len(indexed)} file(s) — {total} chunk(s)."
-    if skipped:
-        msg += f" Skipped {len(skipped)} duplicate/empty."
-    return docs_inner(state, msg, ok=True)
+    # Success is shown by the document appearing in the list — no status banner.
+    return docs_inner(state)
 
 
 @rt("/toggle", methods=["POST"])
@@ -432,52 +456,92 @@ def delete(session, name: str):
 
 @rt("/ask", methods=["POST"])
 def ask(session, question: str):
+    """Return immediately: the user's bubble (shown the instant they hit Enter)
+    plus a streaming placeholder that connects to /stream. The model runs in
+    /stream, not here, so the question appears before the answer starts."""
     sid, state, collection = _state(session)
     selected = [n for n in state["docs"] if state["enabled"].get(n)]
 
+    state["messages"].append({"role": "user", "text": question})
+
     if not selected:
         warn = "Select at least one source (check a box on the left) before asking."
-        state["messages"].append({"role": "user", "text": question})
         state["messages"].append({"role": "assistant", "text": warn, "citations": [], "meta": {}})
+        state["pending"] = None
         _sessions.save(sid, state)
         return user_bubble(question), assistant_bubble(warn, [], {})
 
-    tracer = get_tracer(question, sid)
-    try:
-        with tracer.start_run():
-            with tracer.stage("graph_invoke"):
-                result = rag_graph.invoke({
-                    "user_query":       question,
-                    "session_id":       sid,
-                    "collection_names": [collection],
-                    "source_filenames": selected,
-                    "iteration_count":  0,
-                    "messages":         [],
-                })
-            answer = result.get("final_answer") or "I couldn't generate an answer for that."
-            citations = result.get("citations", [])
-            in_tok = result.get("input_tokens", 0) or 0
-            out_tok = result.get("output_tokens", 0) or 0
-            meta = {
-                "intent":     result.get("query_intent"),
-                "retrieval":  result.get("retrieval_quality"),
-                "confidence": result.get("confidence_score"),
-                "tokens":     (in_tok + out_tok) or None,
-            }
-            tracer.log_query_analysis(result)
-            tracer.log_retrieval(result.get("raw_chunks", []), result.get("retrieval_quality", ""))
-            tracer.log_reranking(result.get("reranked_chunks", []))
-            tracer.log_generation(in_tok, out_tok, result.get("confidence_score", 0.0))
-            tracer.log_final_answer(answer, citations)
-    except Exception as exc:
-        answer, citations, meta = f"Something went wrong: {exc}", [], {}
-
-    state["messages"].append({"role": "user", "text": question})
-    state["messages"].append(
-        {"role": "assistant", "text": answer, "citations": citations, "meta": meta}
-    )
+    mid = uuid4().hex[:8]
+    state["pending"] = {"question": question, "selected": selected, "mid": mid}
     _sessions.save(sid, state)
-    return user_bubble(question), assistant_bubble(answer, citations, meta)
+    return user_bubble(question), stream_shell(mid)
+
+
+@rt("/stream")
+def stream(session):
+    """SSE endpoint (opened by the /ask placeholder). Runs retrieval, then
+    streams the answer token-by-token as `token` events, and finishes with a
+    `done` event carrying the finished bubble (citations + meta)."""
+    sid, state, collection = _state(session)
+    pending = state.get("pending")
+
+    def gen():
+        if not pending:
+            yield sse_message(assistant_bubble("Nothing to answer.", [], {}), event="done")
+            return
+
+        question = pending["question"]
+        selected = pending["selected"]
+        tracer = get_tracer(question, sid)
+        parts: list[str] = []
+        answer, citations, meta = "", [], {}
+        try:
+            with tracer.start_run():
+                with tracer.stage("graph_invoke"):
+                    ctx = context_graph.invoke({
+                        "user_query":       question,
+                        "session_id":       sid,
+                        "collection_names": [collection],
+                        "source_filenames": selected,
+                        "iteration_count":  0,
+                        "messages":         [],
+                    })
+                citations = ctx.get("citations", [])
+                reranked = ctx.get("reranked_chunks", [])
+                confidence = min(1.0, len(reranked) / settings.reranker_top_n) if reranked else 0.0
+
+                usage: dict = {}
+                for delta in stream_generate({**ctx, "user_query": question}, usage):
+                    parts.append(delta)
+                    # Plain str → sse_message emits the rendered HTML unescaped
+                    # (markdown-it already escaped any raw HTML in the source).
+                    yield sse_message(_md.render("".join(parts)), event="token")
+
+                answer = "".join(parts) or "I couldn't generate an answer for that."
+                in_tok = usage.get("input_tokens", 0) or 0
+                out_tok = usage.get("output_tokens", 0) or 0
+                meta = {
+                    "intent":     ctx.get("query_intent"),
+                    "retrieval":  ctx.get("retrieval_quality"),
+                    "confidence": confidence,
+                    "tokens":     (in_tok + out_tok) or None,
+                }
+                tracer.log_query_analysis(ctx)
+                tracer.log_retrieval(ctx.get("raw_chunks", []), ctx.get("retrieval_quality", ""))
+                tracer.log_reranking(reranked)
+                tracer.log_generation(in_tok, out_tok, confidence)
+                tracer.log_final_answer(answer, citations)
+        except Exception as exc:
+            answer, citations, meta = f"Something went wrong: {exc}", [], {}
+
+        state["messages"].append(
+            {"role": "assistant", "text": answer, "citations": citations, "meta": meta}
+        )
+        state["pending"] = None
+        _sessions.save(sid, state)
+        yield sse_message(assistant_bubble(answer, citations, meta), event="done")
+
+    return EventStream(gen())
 
 
 @rt("/reset", methods=["POST"])
