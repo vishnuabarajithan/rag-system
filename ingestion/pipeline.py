@@ -29,8 +29,9 @@ _EMBEDDER      = get_embedder()
 _STORE         = QdrantStore()
 
 _IMAGE_EXTS    = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff"}
-_SHEET_EXTS    = {".xlsx", ".xls", ".ods", ".xlsm"}
+_SHEET_EXTS    = {".xlsx", ".xls", ".ods", ".xlsm", ".csv"}
 _TEXT_EXTS     = {".txt", ".md", ".rst", ".log"}
+_UPSERT_BATCH  = 256   # points per Qdrant write for large documents
 
 
 class IngestionPipeline:
@@ -66,7 +67,7 @@ class IngestionPipeline:
     ) -> int:
         loader = DatabaseLoader(connection_string)
         sheets = loader.load(table_names)
-        total = 0
+        chunks: list[dict] = []
         for sheet in sheets:
             meta = {
                 "filename":   connection_string.split("@")[-1],  # hide credentials
@@ -75,21 +76,20 @@ class IngestionPipeline:
                 "row_count":  sheet["row_count"],
                 "created_at": datetime.utcnow().isoformat(),
             }
-            chunks = _CHUNKER.chunk_table(
+            chunks += _CHUNKER.chunk_table(
                 markdown="",
                 metadata=meta,
                 columns=sheet["columns"] if isinstance(sheet["columns"][0], str) else
                         [c["name"] for c in sheet["columns"]],
                 df=sheet["dataframe"],
             )
-            total += self._embed_and_upsert(chunks, collection)
-        return total
+        return self._embed_and_upsert(chunks, collection)
 
     # ── private helpers ────────────────────────────────────────────────────
 
     def _ingest_pdf(self, path: Path, filename: str, collection: str) -> int:
         pages = _PDF_LOADER.load(path)
-        total = 0
+        chunks: list[dict] = []
         doc_id = str(uuid.uuid4())
 
         for page in pages:
@@ -102,15 +102,15 @@ class IngestionPipeline:
             }
 
             if page["text"]:
-                chunks = _CHUNKER.chunk_text(page["text"], base_meta)
-                total += self._embed_and_upsert(chunks, collection)
+                chunks += _CHUNKER.chunk_text(page["text"], base_meta)
 
             for tbl in page["tables"]:
                 table_meta = {**base_meta, "content_type": "table"}
-                chunks = _CHUNKER.chunk_table(tbl["markdown"], table_meta, columns=[])
-                total += self._embed_and_upsert(chunks, collection)
+                chunks += _CHUNKER.chunk_table(tbl["markdown"], table_meta, columns=[])
 
-        return total
+        # Embed the whole document at once: per-page calls meant one embedding
+        # request per page (~1 s of fixed round-trip each).
+        return self._embed_and_upsert(chunks, collection)
 
     def _ingest_text(self, path: Path, filename: str, collection: str) -> int:
         pages = _TEXT_LOADER.load(path)
@@ -124,8 +124,8 @@ class IngestionPipeline:
         return self._embed_and_upsert(chunks, collection)
 
     def _ingest_spreadsheet(self, path: Path, filename: str, collection: str) -> int:
-        sheets = _SHEET_LOADER.load(path)
-        total = 0
+        sheets = _SHEET_LOADER.load(path, name=Path(filename).stem)
+        chunks: list[dict] = []
         for sheet in sheets:
             meta = {
                 "filename":   filename,
@@ -134,14 +134,13 @@ class IngestionPipeline:
                 "row_count":  sheet["row_count"],
                 "created_at": datetime.utcnow().isoformat(),
             }
-            chunks = _CHUNKER.chunk_table(
+            chunks += _CHUNKER.chunk_table(
                 markdown="",
                 metadata=meta,
                 columns=list(sheet["columns"]),
                 df=sheet["dataframe"],
             )
-            total += self._embed_and_upsert(chunks, collection)
-        return total
+        return self._embed_and_upsert(chunks, collection)
 
     def _ingest_image(self, path: Path, filename: str, collection: str) -> int:
         result = _IMAGE_LOADER.load(path)
@@ -154,6 +153,9 @@ class IngestionPipeline:
         return self._embed_and_upsert(chunks, collection)
 
     def _embed_and_upsert(self, chunks: list[dict], collection: str) -> int:
+        """Embed and store ALL of a document's chunks in one pass. Callers
+        must collect every chunk first: the embedder batches (and parallelises)
+        requests, which only pays off when it is handed the whole document."""
         if not chunks:
             return 0
 
@@ -175,5 +177,6 @@ class IngestionPipeline:
                 },
             })
 
-        _STORE.upsert(collection, points)
+        for i in range(0, len(points), _UPSERT_BATCH):
+            _STORE.upsert(collection, points[i:i + _UPSERT_BATCH])
         return len(points)

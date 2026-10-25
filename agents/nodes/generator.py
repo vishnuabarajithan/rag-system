@@ -1,16 +1,6 @@
-from google import genai
-from google.genai import types
+from agents import llm
 from agents.state import AgentState
 from config.settings import settings
-
-_client = None
-
-
-def _get_client() -> genai.Client:
-    global _client
-    if _client is None:
-        _client = genai.Client(api_key=settings.google_api_key)
-    return _client
 
 _SYSTEM = """You are a precise, grounded research assistant.
 Answer questions ONLY using the provided context chunks.
@@ -27,29 +17,19 @@ _INTENT_HINTS = {
 }
 
 
-def run(state: AgentState) -> dict:
+def _build_user_message(state: AgentState) -> str:
     context = state.get("context_window", "")
     query = state["user_query"]
     intent = state.get("query_intent", "factual")
     hint = _INTENT_HINTS.get(intent, "")
+    return f"Context:\n{context}\n\n---\nQuestion: {query}\n{hint}"
 
-    user_message = f"Context:\n{context}\n\n---\nQuestion: {query}\n{hint}"
 
-    response = _get_client().models.generate_content(
-        model=settings.generation_model,
-        contents=user_message,
-        config=types.GenerateContentConfig(
-            system_instruction=_SYSTEM,
-            max_output_tokens=4096,
-        ),
+def run(state: AgentState) -> dict:
+    answer_text, input_tokens, output_tokens = llm.chat(
+        _SYSTEM, _build_user_message(state), max_tokens=settings.max_answer_tokens
     )
-
-    answer_text = response.text or ""
-
-    usage = response.usage_metadata
-    input_tokens = getattr(usage, "prompt_token_count", 0) or 0
-    output_tokens = getattr(usage, "candidates_token_count", 0) or 0
-    confidence = min(1.0, len(state.get("reranked_chunks", [])) / settings.reranker_top_n)
+    confidence = min(1.0, len(state.get("top_chunks", [])) / settings.context_top_n)
 
     return {
         "final_answer": answer_text,
@@ -59,38 +39,11 @@ def run(state: AgentState) -> dict:
     }
 
 
-def _build_user_message(state: AgentState) -> str:
-    context = state.get("context_window", "")
-    query = state["user_query"]
-    intent = state.get("query_intent", "factual")
-    hint = _INTENT_HINTS.get(intent, "")
-    return f"Context:\n{context}\n\n---\nQuestion: {query}\n{hint}"
-
-
 def stream_generate(state: AgentState, usage: dict):
-    """Stream the grounded answer token-by-token from Gemini.
+    """Stream the grounded answer token-by-token.
 
     Yields text deltas as they arrive. `usage` is a mutable dict that is
-    populated with `input_tokens`/`output_tokens` from the stream's usage
-    metadata (available on the final chunks). Same prompt/system instruction as
-    the non-streaming `run` above, so answers are identical in content.
+    populated with `input_tokens`/`output_tokens` from the stream's final usage
+    chunk. Same prompt/system instruction as the non-streaming `run` above.
     """
-    response = _get_client().models.generate_content_stream(
-        model=settings.generation_model,
-        contents=_build_user_message(state),
-        config=types.GenerateContentConfig(
-            system_instruction=_SYSTEM,
-            max_output_tokens=4096,
-        ),
-    )
-    for chunk in response:
-        u = getattr(chunk, "usage_metadata", None)
-        if u:
-            usage["input_tokens"] = getattr(u, "prompt_token_count", 0) or usage.get("input_tokens", 0)
-            usage["output_tokens"] = getattr(u, "candidates_token_count", 0) or usage.get("output_tokens", 0)
-        try:
-            text = chunk.text
-        except Exception:
-            text = None
-        if text:
-            yield text
+    yield from llm.chat_stream(_SYSTEM, _build_user_message(state), settings.max_answer_tokens, usage)

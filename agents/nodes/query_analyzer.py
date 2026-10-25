@@ -1,20 +1,8 @@
-import json
-from google import genai
-from google.genai import types
+from agents import llm
 from agents.state import AgentState
-from config.settings import settings
-
-_client = None
-
-
-def _get_client() -> genai.Client:
-    global _client
-    if _client is None:
-        _client = genai.Client(api_key=settings.google_api_key)
-    return _client
 
 _SYSTEM = """You are a query analysis expert for a RAG system.
-Given a user question, return ONLY valid JSON with these keys:
+Given a user question, return ONLY valid JSON (no prose, no code fences) with these keys:
 - expanded_queries: list of 1-3 semantically diverse sub-queries that cover the question from different angles
 - query_intent: one of [factual, analytical, summarize, compare]
 - query_filters: dict of metadata filters explicitly mentioned (e.g. {"file_type": "pdf", "sheet_name": "Sales"}) — empty dict if none
@@ -33,25 +21,18 @@ def run(state: AgentState) -> dict:
             "Generate broader, more general sub-queries this time."
         )
 
-    response = _get_client().models.generate_content(
-        model=settings.routing_model,
-        contents=f"Query: {query}{relaxation}",
-        config=types.GenerateContentConfig(
-            system_instruction=_SYSTEM,
-            max_output_tokens=512,
-            response_mime_type="application/json",
-        ),
-    )
+    text, _, _ = llm.chat(_SYSTEM, f"Query: {query}{relaxation}", max_tokens=512)
+    analysis = llm.parse_json(text)
 
-    try:
-        analysis = json.loads(response.text)
-    except (json.JSONDecodeError, TypeError):
-        analysis = {}
+    expanded = analysis.get("expanded_queries")
+    if not isinstance(expanded, list) or not all(isinstance(q, str) for q in expanded):
+        expanded = []
+    filters = analysis.get("query_filters")
 
     return {
-        "expanded_queries": analysis.get("expanded_queries", [query]),
+        "expanded_queries": expanded or [query],
         "query_intent": analysis.get("query_intent", "factual"),
-        "query_filters": analysis.get("query_filters", {}),
+        "query_filters": filters if isinstance(filters, dict) else {},
         "requires_table_reasoning": analysis.get("requires_table_reasoning", False),
         "requires_image_understanding": analysis.get("requires_image_understanding", False),
         "iteration_count": iteration + 1,

@@ -100,12 +100,11 @@ class RAGTracer:
             self._run = run
             _safe(lambda: mlflow.log_params({
                 "session_id":       self.session_id,
-                "generation_model": settings.generation_model,
-                "routing_model":    settings.routing_model,
+                "llm_provider":     settings.llm_provider,
+                "llm_model":        settings.llm_model or "(provider default)",
                 "retriever_top_k":  settings.retriever_top_k,
-                "reranker_top_n":   settings.reranker_top_n,
+                "context_top_n":    settings.context_top_n,
                 "embedding_model":  settings.embedding_model,
-                "reranker_model":   settings.reranker_model,
             }))
             _safe(lambda: mlflow.log_param("query_preview", self.query[:200]))
             try:
@@ -148,15 +147,6 @@ class RAGTracer:
             _safe(lambda: mlflow.log_metrics({
                 "retrieval_max_score":  max(scores),
                 "retrieval_mean_score": sum(scores) / len(scores),
-            }))
-
-    def log_reranking(self, reranked_chunks: list[dict]) -> None:
-        _safe(lambda: mlflow.log_metric("num_reranked_chunks", len(reranked_chunks)))
-        if reranked_chunks:
-            scores = [c.get("rerank_score", 0.0) for c in reranked_chunks]
-            _safe(lambda: mlflow.log_metrics({
-                "rerank_top_score":  max(scores),
-                "rerank_mean_score": sum(scores) / len(scores),
             }))
 
     def log_generation(
@@ -221,7 +211,6 @@ class NoopTracer:
 
     def log_query_analysis(self, *a, **k) -> None: ...
     def log_retrieval(self, *a, **k) -> None: ...
-    def log_reranking(self, *a, **k) -> None: ...
     def log_generation(self, *a, **k) -> None: ...
     def log_final_answer(self, *a, **k) -> None: ...
     def log_cache_hit(self, *a, **k) -> None: ...
