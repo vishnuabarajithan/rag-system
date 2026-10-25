@@ -9,7 +9,6 @@ class RetrievedChunk(TypedDict):
     content: str
     content_type: str           # "text" | "table" | "image_caption"
     score: float                # initial hybrid retrieval score
-    rerank_score: Optional[float]
     metadata: dict              # filename, page_num, sheet_name, etc.
 
 
@@ -29,7 +28,7 @@ class AgentState(TypedDict):
 
     # ── Retrieval ───────────────────────────────────────────────────────────
     raw_chunks: list[RetrievedChunk]
-    reranked_chunks: list[RetrievedChunk]
+    top_chunks: list[RetrievedChunk]     # best context_top_n of raw_chunks, fused order
     context_window: str
 
     # ── Generation ──────────────────────────────────────────────────────────

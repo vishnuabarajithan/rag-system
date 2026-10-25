@@ -1,10 +1,12 @@
 from agents.state import AgentState
+from config.settings import settings
 
-_MAX_CONTEXT_CHARS = 80_000  # ≈ 20k tokens
+# Excerpt length kept per citation for the UI preview popup.
+_EXCERPT_CHARS = 1500
 
 
 def run(state: AgentState) -> dict:
-    chunks = state.get("reranked_chunks", [])
+    chunks = state.get("top_chunks", [])
     citations: list[dict] = []
     parts: list[str] = []
     total_chars = 0
@@ -34,13 +36,13 @@ def run(state: AgentState) -> dict:
                 f"{chunk['content']}"
             )
 
-        if total_chars + len(block) > _MAX_CONTEXT_CHARS:
+        if total_chars + len(block) > settings.max_context_chars:
             break
 
         parts.append(block)
         total_chars += len(block)
         raw = chunk.get("content") or ""
-        excerpt = raw[:600] + ("…" if len(raw) > 600 else "")
+        excerpt = raw[:_EXCERPT_CHARS] + ("…" if len(raw) > _EXCERPT_CHARS else "")
         citations.append({
             "ref": ref,
             "chunk_id": chunk.get("chunk_id"),

@@ -96,7 +96,6 @@ class QdrantStore:
                 "content":      r.payload.get("content", ""),
                 "content_type": r.payload.get("content_type", "text"),
                 "score":        r.score,
-                "rerank_score": None,
                 "metadata": {
                     k: v for k, v in r.payload.items()
                     if k not in ("content", "document_id", "content_type")
@@ -130,6 +129,14 @@ class QdrantStore:
             self._client.delete_collection(collection_name=collection)
         except Exception:
             pass
+
+    def drop_collections_with_prefix(self, prefix: str) -> int:
+        """Delete every collection whose name starts with `prefix`; returns the count."""
+        names = [c.name for c in self._client.get_collections().collections
+                 if c.name.startswith(prefix)]
+        for name in names:
+            self.drop_collection(name)
+        return len(names)
 
     def delete_by_filename(self, collection: str, filename: str) -> None:
         from qdrant_client.models import FilterSelector

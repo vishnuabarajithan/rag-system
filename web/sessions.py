@@ -54,6 +54,9 @@ class InMemorySessionStore:
         self._data[sid] = _new_state()
         return self._data[sid]
 
+    def drop(self, sid: str) -> None:
+        self._data.pop(sid, None)
+
 
 class RedisSessionStore:
     """JSON-per-session store in Redis. Untested locally (needs a Redis server)."""
@@ -85,6 +88,9 @@ class RedisSessionStore:
         state = _new_state()
         self.save(sid, state)
         return state
+
+    def drop(self, sid: str) -> None:
+        self._redis.delete(self._key(sid))
 
 
 _store: InMemorySessionStore | RedisSessionStore | None = None

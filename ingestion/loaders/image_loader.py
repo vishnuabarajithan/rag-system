@@ -27,6 +27,8 @@ _MEDIA_TYPES = {
     "png": "image/png",
     "gif": "image/gif",
     "webp": "image/webp",
+    "bmp": "image/bmp",
+    "tiff": "image/tiff",
 }
 
 
@@ -40,12 +42,24 @@ class ImageLoader:
         except Exception:
             pass
 
-        caption = self._caption(path)
+        # The caption is best-effort: a Gemini quota/network error shouldn't
+        # fail the upload when OCR already found text.
+        try:
+            caption = self._caption(path)
+        except Exception:
+            caption = ""
+
+        if not ocr_text and not caption:
+            raise ValueError(
+                "couldn't read this image: no text found by OCR (is Tesseract "
+                "installed?) and the image description service failed"
+            )
 
         combined = ""
         if ocr_text:
             combined += f"[OCR TEXT]: {ocr_text}\n\n"
-        combined += f"[VISUAL DESCRIPTION]: {caption}"
+        if caption:
+            combined += f"[VISUAL DESCRIPTION]: {caption}"
 
         return {
             "ocr_text": ocr_text,
@@ -59,7 +73,7 @@ class ImageLoader:
         media_type = _MEDIA_TYPES.get(ext, "image/png")
 
         response = _get_client().models.generate_content(
-            model=settings.routing_model,
+            model=settings.vision_model,
             contents=[
                 types.Part.from_bytes(
                     data=path.read_bytes(),
@@ -71,6 +85,11 @@ class ImageLoader:
                     "labels, or legends."
                 ),
             ],
-            config=types.GenerateContentConfig(max_output_tokens=512),
+            # thinking_budget=0: gemini-2.5-flash otherwise spends most of
+            # max_output_tokens on hidden reasoning and truncates the caption.
+            config=types.GenerateContentConfig(
+                max_output_tokens=1024,
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
+            ),
         )
         return response.text or ""

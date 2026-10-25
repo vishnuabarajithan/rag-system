@@ -1,6 +1,6 @@
 """
-Integration test: runs the full LangGraph graph against a mock Qdrant.
-Requires GOOGLE_API_KEY in environment.
+Integration test: runs the full LangGraph graph against a mock Qdrant and a
+mock embedder. Makes live Qwen calls, so it requires HF_TOKEN.
 """
 import pytest
 from unittest.mock import patch, MagicMock
@@ -16,7 +16,6 @@ def mock_qdrant():
                 "content":     "The quarterly revenue was $4.2M in Q3 2024.",
                 "content_type":"text",
                 "score":       0.91,
-                "rerank_score":None,
                 "metadata": {"filename": "report.pdf", "page_num": 3},
             }
         ]
@@ -25,9 +24,10 @@ def mock_qdrant():
 
 @pytest.fixture
 def mock_embed():
-    with patch("ingestion.embedders.text_embedder.TextEmbedder.embed") as mock:
-        mock.return_value = [0.1] * 768
-        yield mock
+    embedder = MagicMock()
+    embedder.embed.return_value = [0.1] * 768
+    with patch("agents.nodes.retriever._embedder", embedder):
+        yield embedder
 
 
 @pytest.mark.integration
@@ -43,5 +43,6 @@ def test_rag_graph_returns_answer(mock_qdrant, mock_embed):
     })
 
     assert result.get("final_answer"), "Expected a non-empty answer"
+    assert "<think>" not in result["final_answer"]
     assert isinstance(result.get("citations"), list)
     assert result.get("retrieval_quality") in ("sufficient", "insufficient", "empty")

@@ -8,8 +8,11 @@ _store = QdrantStore()
 
 
 def run(state: AgentState) -> dict:
-    all_chunks: list[RetrievedChunk] = []
-    seen_ids: set[str] = set()
+    # Multi-query fusion: each expanded sub-query gets its own hybrid (RRF)
+    # search; a chunk's scores are summed across sub-queries, so chunks that
+    # several sub-queries agree on rank highest. This ordering is what picks
+    # the context (there is no separate reranker).
+    fused: dict[str, RetrievedChunk] = {}
 
     collection = (state.get("collection_names") or ["default"])[0]
 
@@ -24,9 +27,12 @@ def run(state: AgentState) -> dict:
             filenames=state.get("source_filenames") or None,
         )
         for r in results:
-            if r["chunk_id"] not in seen_ids:
-                seen_ids.add(r["chunk_id"])
-                all_chunks.append(RetrievedChunk(**r))
+            if r["chunk_id"] in fused:
+                fused[r["chunk_id"]]["score"] += r["score"]
+            else:
+                fused[r["chunk_id"]] = RetrievedChunk(**r)
+
+    all_chunks = sorted(fused.values(), key=lambda c: c["score"], reverse=True)
 
     if len(all_chunks) == 0:
         quality = "empty"
@@ -37,6 +43,7 @@ def run(state: AgentState) -> dict:
 
     return {
         "raw_chunks": all_chunks,
+        "top_chunks": all_chunks[:settings.context_top_n],
         "retrieval_quality": quality,
         # Bound the insufficient/empty retry loops: each retrieval attempt
         # counts toward the iteration cap checked in _route_after_retrieval.

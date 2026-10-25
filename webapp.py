@@ -4,10 +4,12 @@ FastHTML chatbot UI for the RAG system.
 Upload multiple documents, toggle individual sources in/out of the retrieval
 context, delete sources, and reset to a clean per-session state. Each browser
 session is isolated: identity rides in a signed cookie and each session gets its
-own Qdrant collection, so users never see each other's documents.
+own Qdrant collection, so users never see each other's documents. Sessions are
+ephemeral: every page load (refresh or Reset) discards the previous session's
+documents and chat and starts fresh.
 
 Runs entirely in-process by default — embedded (local) Qdrant + the existing
-ingestion pipeline + the Gemini-powered LangGraph agent — so no Docker is
+ingestion pipeline + the Qwen-powered LangGraph agent — so no Docker is
 required for local use.
 
 Run (local / dev):
@@ -26,6 +28,8 @@ from pathlib import Path
 # Must be set before any project module imports config.settings.
 os.environ.setdefault("QDRANT_LOCAL_PATH", str(Path(__file__).parent / "qdrant_local"))
 
+import re
+from datetime import date
 from uuid import uuid4
 
 from markdown_it import MarkdownIt
@@ -44,6 +48,48 @@ from monitoring.mlflow_tracer import get_tracer
 _pipeline = IngestionPipeline()
 _store = QdrantStore()
 _sessions = get_session_store()
+
+# Embedded Qdrant persists to disk, and sessions are ephemeral: collections
+# left by a previous run belong to sessions that no longer exist. Only safe in
+# embedded mode (single process) — with a shared Qdrant server, another
+# worker's live sessions would be deleted.
+if settings.qdrant_local_path:
+    _store.drop_collections_with_prefix(collection_for(""))
+
+# Public-demo guard. The per-visitor count lives in the signed cookie, so
+# a fresh session (which only rotates `sid`) doesn't clear it. The daily count is
+# process-wide — fine for the single-worker deployment.
+_daily = {"date": None, "count": 0}
+
+
+def _limit_reason(session) -> str | None:
+    """Return a user-facing message if a question cap is hit, else None."""
+    cap = settings.max_questions_per_session
+    if cap and session.get("q_count", 0) >= cap:
+        return f"You've reached this demo's limit of {cap} questions. Thanks for trying it!"
+    today = date.today().isoformat()
+    if _daily["date"] != today:
+        _daily["date"], _daily["count"] = today, 0
+    if settings.daily_question_limit and _daily["count"] >= settings.daily_question_limit:
+        return "The demo has reached its daily question limit. Please try again tomorrow."
+    return None
+
+
+def _count_question(session) -> None:
+    session["q_count"] = session.get("q_count", 0) + 1
+    _daily["count"] += 1
+
+
+def _friendly_error(exc: Exception) -> str:
+    """Turn provider errors into something a visitor can act on."""
+    msg = str(exc)
+    if "429" in msg or "RESOURCE_EXHAUSTED" in msg or "rate limit" in msg.lower():
+        return "The AI service is busy right now (rate limit). Please wait a minute and try again."
+    if "402" in msg or "credits" in msg.lower():
+        return "The AI service's usage allowance has run out. Please try again later."
+    if "401" in msg or "403" in msg:
+        return "The AI service rejected the API key. Check the server's configuration."
+    return f"Something went wrong: {msg[:300]}"
 
 # `default` preset keeps raw HTML escaped (safe for model output); enable GFM
 # tables (compare-intent answers) and strikethrough.
@@ -89,7 +135,6 @@ body{font-family:'Inter',system-ui,-apple-system,sans-serif;color:var(--text);
   text-shadow:0 0 10px rgba(255,255,255,.55),0 0 24px rgba(255,255,255,.25),0 2px 0 #000}
 .sidebar h3{font-size:11px;letter-spacing:.09em;text-transform:uppercase;
   color:var(--muted);margin:6px 0 0;font-weight:600}
-.sess-id{font-size:11px;color:var(--muted);font-family:ui-monospace,monospace}
 .muted{color:var(--muted);font-size:13px}
 
 /* doc rows */
@@ -106,6 +151,10 @@ body{font-family:'Inter',system-ui,-apple-system,sans-serif;color:var(--text);
 .trash:hover{color:var(--err);background:rgba(245,101,101,.12)}
 
 .upload-form{display:flex;flex-direction:column;gap:11px}
+/* HTMX puts .htmx-request on the form while /upload runs */
+.upload-form .busy{display:none}
+.upload-form.htmx-request .idle{display:none}
+.upload-form.htmx-request .busy{display:inline}
 input[type=file]{font-size:12.5px;color:var(--muted);width:100%}
 input[type=file]::file-selector-button{background:var(--panel-2);color:var(--text);
   border:1px solid var(--border);padding:7px 11px;border-radius:8px;margin-right:10px;
@@ -162,20 +211,38 @@ input[type=file]::file-selector-button{background:var(--panel-2);color:var(--tex
   padding-left:12px;color:var(--muted)}
 .bubble.assistant strong{font-weight:700}
 
-.cites{display:flex;flex-wrap:wrap;gap:6px;margin-top:11px}
-.cite{position:relative;font-size:11px;color:var(--muted);background:var(--panel);
-  border:1px solid var(--border);padding:3px 9px;border-radius:7px;cursor:default}
-.cite.has-pop:hover{color:var(--text);border-color:var(--accent)}
-.cite-pop{position:absolute;bottom:calc(100% + 8px);left:0;z-index:50;
-  width:320px;max-height:240px;overflow:auto;
-  background:var(--panel);border:1px solid var(--border);border-radius:10px;
-  padding:10px 12px;box-shadow:0 10px 34px rgba(0,0,0,.65);
-  opacity:0;visibility:hidden;transform:translateY(5px);pointer-events:none;
-  transition:opacity .12s ease,transform .12s ease}
-.cite.has-pop:hover .cite-pop{opacity:1;visibility:visible;transform:translateY(0)}
-.cite-pop-head{color:var(--muted);font-size:10.5px;letter-spacing:.03em;
-  margin-bottom:6px;padding-bottom:5px;border-bottom:1px solid var(--border)}
-.cite-pop-body{color:var(--text);font-size:12px;line-height:1.55;white-space:pre-wrap}
+/* citations: inline [N] links + source chips, both open the preview dialog */
+.cites{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-top:11px}
+.cites-label{font-size:11px;color:var(--muted);margin-right:2px}
+.cite{font:inherit;font-size:11px;color:var(--muted);background:var(--panel);
+  border:1px solid var(--border);padding:3px 9px;border-radius:7px;cursor:pointer;
+  max-width:100%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cite:hover,.cite:focus-visible{color:var(--text);border-color:var(--accent);outline:none}
+.bubble.assistant a.cite-link{color:var(--text);text-decoration:none;font-weight:600;
+  font-size:.78em;padding:1px 5px;margin-left:2px;border-radius:6px;cursor:pointer;
+  background:rgba(255,255,255,.1);border:1px solid var(--border);white-space:nowrap}
+.bubble.assistant a.cite-link:hover{background:rgba(255,255,255,.2);border-color:var(--accent)}
+.cite-data{display:none}
+
+.cite-modal{background:var(--panel);color:var(--text);border:1px solid var(--border);
+  border-radius:14px;padding:0;width:min(680px,calc(100vw - 32px));max-height:80vh;
+  box-shadow:0 20px 60px rgba(0,0,0,.7)}
+.cite-modal::backdrop{background:rgba(0,0,0,.6);backdrop-filter:blur(2px)}
+.cite-modal-inner{display:flex;flex-direction:column;max-height:80vh}
+.cite-modal-top{display:flex;align-items:center;gap:12px;padding:14px 18px;
+  border-bottom:1px solid var(--border)}
+.cite-modal-ref{font-weight:700;font-size:14px}
+.cite-modal-head{flex:1;min-width:0;color:var(--muted);font-size:12.5px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cite-modal-close{background:none;border:1px solid var(--border);color:var(--text);
+  border-radius:8px;padding:4px 9px;cursor:pointer;font-size:13px}
+.cite-modal-close:hover{background:rgba(255,255,255,.08)}
+.cite-modal-body{padding:16px 18px;overflow:auto;font-size:13.5px;line-height:1.6}
+.cite-modal-body.plain{white-space:pre-wrap}
+.cite-modal-body table{border-collapse:collapse;font-size:12.5px}
+.cite-modal-body th,.cite-modal-body td{border:1px solid var(--border);padding:5px 9px;text-align:left}
+.cite-modal-body th{background:var(--panel-2)}
+.cite-modal-body p{margin:0 0 10px}
 .meta{margin-top:9px;font-size:11px;color:var(--muted);opacity:.85}
 .thinking{color:var(--muted);font-size:13px;padding:0 28px 12px;display:none}
 .htmx-request.thinking{display:block}
@@ -267,31 +334,67 @@ def user_bubble(text):
     return Div(Div(text, cls="bubble user"), cls="row user")
 
 
+_CITE_RE = re.compile(r"\[(\d+(?:\s*,\s*\d+)*)\]")
+# Leave citation-looking text inside code alone.
+_CODE_RE = re.compile(r"(<pre[\s\S]*?</pre>|<code[\s\S]*?</code>)")
+
+
+def _ref_num(c) -> str:
+    return (c.get("ref") or "").strip("[]")
+
+
+def _link_citations(html: str, valid: set[str]) -> tuple[str, set[str]]:
+    """Turn [N] / [N, M] markers in rendered answer HTML into clickable links
+    (only for refs that exist). Returns the new HTML and the refs used."""
+    used: set[str] = set()
+
+    def repl(m):
+        nums = [n.strip() for n in m.group(1).split(",")]
+        if not all(n in valid for n in nums):
+            return m.group(0)
+        used.update(nums)
+        return "".join(
+            f'<a href="#" class="cite-link" data-ref="{n}" title="Preview source {n}">[{n}]</a>'
+            for n in nums
+        )
+
+    parts = _CODE_RE.split(html)
+    for i in range(0, len(parts), 2):  # even indices are outside code
+        parts[i] = _CITE_RE.sub(repl, parts[i])
+    return "".join(parts), used
+
+
 def cite_chip(c):
-    ref = c.get("ref", "")
+    n = _ref_num(c)
     src = c.get("source_file", "?")
     page = c.get("page_num")
     sheet = c.get("sheet_name")
-    label = f"{ref} {src}" + (f" · p.{page}" if page else "")
-    excerpt = c.get("content")
-    if not excerpt:
-        return Span(label, cls="cite")
-    head = src + (f" · p.{page}" if page else "") + (f" · {sheet}" if sheet else "")
-    return Span(
-        label,
+    where = (f" · p.{page}" if page else "") + (f" · {sheet}" if sheet else "")
+    excerpt = c.get("content") or ""
+    # Tables are stored as markdown → render them; prose stays as plain text.
+    is_table = c.get("content_type") == "table"
+    return (
+        Button(f"[{n}] {src}{where}", type="button", cls="cite", data_ref=n,
+               title="Preview this source"),
         Div(
-            Div(head, cls="cite-pop-head"),
-            Div(excerpt, cls="cite-pop-body"),
-            cls="cite-pop",
+            Div(src + where, cls="cite-head"),
+            Div(_render_md(excerpt) if is_table else excerpt,
+                cls="cite-body" + ("" if is_table else " plain")),
+            cls="cite-data", data_ref=n,
         ),
-        cls="cite has-pop",
     )
 
 
 def assistant_bubble(text, citations, meta):
+    html = _md.render(text or "")
     cite_chips = None
     if citations:
-        cite_chips = Div(*[cite_chip(c) for c in citations], cls="cites")
+        html, used = _link_citations(html, {_ref_num(c) for c in citations})
+        # Only list the sources the answer actually cites.
+        cited = [c for c in citations if _ref_num(c) in used]
+        if cited:
+            cite_chips = Div(Span("Sources:", cls="cites-label"),
+                             *[x for c in cited for x in cite_chip(c)], cls="cites")
 
     meta_line = None
     if meta:
@@ -308,7 +411,7 @@ def assistant_bubble(text, citations, meta):
             meta_line = Div("  ·  ".join(bits), cls="meta")
 
     return Div(
-        Div(_render_md(text), cite_chips, meta_line, cls="bubble assistant"),
+        Div(NotStr(html), cite_chips, meta_line, cls="bubble assistant"),
         cls="row assistant",
     )
 
@@ -353,13 +456,66 @@ def composer():
 
 
 # ── routes ──────────────────────────────────────────────────────────────────
+def _discard_session(session) -> None:
+    """Delete the current session's documents + chat, and start a new one."""
+    old = session.get("sid")
+    if old:
+        _store.drop_collection(collection_for(old))
+        _sessions.drop(old)
+    session["sid"] = uuid4().hex
+
+
+# Citation preview dialog: chips and inline [N] links (event-delegated, so it
+# also works for bubbles swapped in by HTMX) copy the matching hidden
+# `.cite-data` block from the same bubble into the dialog.
+_CITE_JS = """
+document.addEventListener('click', function (e) {
+  var dlg = document.getElementById('cite-modal');
+  if (e.target === dlg) { dlg.close(); return; }          // backdrop click
+  var t = e.target.closest('.cite, .cite-link');
+  if (!t) return;
+  e.preventDefault();
+  var bubble = t.closest('.bubble');
+  var data = bubble && bubble.querySelector('.cite-data[data-ref="' + t.dataset.ref + '"]');
+  if (!data) return;
+  var src = data.querySelector('.cite-body');
+  var body = document.getElementById('cite-modal-body');
+  document.getElementById('cite-modal-ref').textContent = '[' + t.dataset.ref + ']';
+  document.getElementById('cite-modal-head').textContent = data.querySelector('.cite-head').textContent;
+  body.innerHTML = src.innerHTML;
+  body.className = 'cite-modal-body' + (src.classList.contains('plain') ? ' plain' : '');
+  body.scrollTop = 0;
+  dlg.showModal();
+});
+"""
+
+
+def cite_modal():
+    return Dialog(
+        Div(
+            Div(
+                Span(id="cite-modal-ref", cls="cite-modal-ref"),
+                Span(id="cite-modal-head", cls="cite-modal-head"),
+                Button("✕", type="button", cls="cite-modal-close", title="Close",
+                       onclick="this.closest('dialog').close()"),
+                cls="cite-modal-top",
+            ),
+            Div(id="cite-modal-body", cls="cite-modal-body"),
+            cls="cite-modal-inner",
+        ),
+        id="cite-modal", cls="cite-modal",
+    )
+
+
 @rt("/")
 def index(session):
+    # Every page load (refresh, or the redirect after Reset) starts a fresh
+    # session: the previous session's uploaded documents are discarded.
+    _discard_session(session)
     sid, state, _ = _state(session)
     return Title("RAG Chat"), Div(
         Div(
             Div("RAG CHAT", cls="brand"),
-            Div(f"session_{sid[:8]}", cls="sess-id"),
             Div(
                 H3("Documents"),
                 docs_inner(state),
@@ -367,17 +523,22 @@ def index(session):
             ),
             Form(
                 Input(type="file", name="file", required=True, multiple=True,
-                      accept=".pdf,.txt,.md,.csv,.xlsx,.xls,.png,.jpg,.jpeg"),
-                Button("Upload", cls="btn", type="submit"),
+                      accept=".pdf,.txt,.md,.csv,.xlsx,.xls,.png,.jpg,.jpeg,.webp"),
+                Button(Span("Upload", cls="idle"), Span("Indexing", Span(cls="dots"), cls="busy"),
+                       cls="btn", type="submit"),
                 hx_post="/upload", hx_target="#docs-inner", hx_swap="outerHTML",
                 hx_encoding="multipart/form-data", hx_disabled_elt="button",
                 cls="upload-form",
             ),
             Button("↺  Reset session", cls="btn btn-ghost",
                    hx_post="/reset", hx_confirm="Delete all documents and start fresh?"),
-            Div("Supported: PDF, TXT, MD, XLSX, images. "
-                "Everything runs locally; answers come from Gemini grounded in your files.",
+            Div("Supported: PDF, TXT, MD, CSV, XLSX, images. "
+                "Answers come from Qwen, grounded only in your files. "
+                "Refreshing the page starts a new session and discards your uploads.",
                 cls="hint"),
+            Div(f"Demo: up to {settings.max_questions_per_session} questions per visitor.",
+                cls="hint", style="margin-top:0;border-top:none;padding-top:0")
+            if settings.max_questions_per_session else None,
             cls="sidebar",
         ),
         Div(
@@ -390,41 +551,47 @@ def index(session):
             cls="main",
         ),
         cls="app",
-    ), Script(
+    ), cite_modal(), Script(
         "function _scrollMsgs(){var m=document.getElementById('messages');"
         "if(m) m.scrollTop=m.scrollHeight;}"
         "document.body.addEventListener('htmx:afterSwap', _scrollMsgs);"
         "document.body.addEventListener('htmx:sseMessage', _scrollMsgs);"
-    )
+    ), Script(_CITE_JS)
 
 
 @rt("/upload", methods=["POST"])
 async def upload(session, file: list[UploadFile]):
     sid, state, collection = _state(session)
     files = file if isinstance(file, list) else [file]
-    indexed, skipped, total = [], [], 0
-    try:
-        for f in files:
-            if not f or not f.filename:
-                continue
-            if f.filename in state["docs"]:
-                skipped.append(f.filename)
-                continue
-            content = await f.read()
-            if not content:
-                skipped.append(f.filename)
-                continue
+    indexed, skipped, failed = [], [], []
+    # Each file is indexed independently: one bad file doesn't block the rest.
+    for f in files:
+        if not f or not f.filename:
+            continue
+        if f.filename in state["docs"]:
+            skipped.append(f.filename)
+            continue
+        content = await f.read()
+        if not content:
+            skipped.append(f.filename)
+            continue
+        try:
             count = _pipeline.ingest_file(
                 filename=f.filename, content=content, collection=collection
             )
-            state["docs"].append(f.filename)
-            state["enabled"][f.filename] = True
-            indexed.append(f.filename)
-            total += count
-        _sessions.save(sid, state)
-    except Exception as exc:
-        return docs_inner(state, f"Failed to index: {exc}", ok=False)
+        except Exception as exc:
+            failed.append(f"{f.filename}: {_friendly_error(exc).removeprefix('Something went wrong: ')}")
+            continue
+        if not count:
+            failed.append(f"{f.filename}: no readable text found")
+            continue
+        state["docs"].append(f.filename)
+        state["enabled"][f.filename] = True
+        indexed.append(f.filename)
+    _sessions.save(sid, state)
 
+    if failed:
+        return docs_inner(state, "Couldn't index " + "; ".join(failed), ok=False)
     if not indexed:
         return docs_inner(state, "Nothing new to index (duplicates or empty).", ok=False)
     # Success is shown by the document appearing in the list — no status banner.
@@ -471,6 +638,14 @@ def ask(session, question: str):
         _sessions.save(sid, state)
         return user_bubble(question), assistant_bubble(warn, [], {})
 
+    limited = _limit_reason(session)
+    if limited:
+        state["messages"].append({"role": "assistant", "text": limited, "citations": [], "meta": {}})
+        state["pending"] = None
+        _sessions.save(sid, state)
+        return user_bubble(question), assistant_bubble(limited, [], {})
+    _count_question(session)
+
     mid = uuid4().hex[:8]
     state["pending"] = {"question": question, "selected": selected, "mid": mid}
     _sessions.save(sid, state)
@@ -507,8 +682,8 @@ def stream(session):
                         "messages":         [],
                     })
                 citations = ctx.get("citations", [])
-                reranked = ctx.get("reranked_chunks", [])
-                confidence = min(1.0, len(reranked) / settings.reranker_top_n) if reranked else 0.0
+                top = ctx.get("top_chunks", [])
+                confidence = min(1.0, len(top) / settings.context_top_n) if top else 0.0
 
                 usage: dict = {}
                 for delta in stream_generate({**ctx, "user_query": question}, usage):
@@ -528,11 +703,10 @@ def stream(session):
                 }
                 tracer.log_query_analysis(ctx)
                 tracer.log_retrieval(ctx.get("raw_chunks", []), ctx.get("retrieval_quality", ""))
-                tracer.log_reranking(reranked)
                 tracer.log_generation(in_tok, out_tok, confidence)
                 tracer.log_final_answer(answer, citations)
         except Exception as exc:
-            answer, citations, meta = f"Something went wrong: {exc}", [], {}
+            answer, citations, meta = _friendly_error(exc), [], {}
 
         state["messages"].append(
             {"role": "assistant", "text": answer, "citations": citations, "meta": meta}
@@ -546,14 +720,8 @@ def stream(session):
 
 @rt("/reset", methods=["POST"])
 def reset(session):
-    sid, _, collection = _state(session)
-    try:
-        _store.drop_collection(collection)
-    except Exception:
-        pass
-    # New identity → new empty session collection on next load.
-    session["sid"] = uuid4().hex
-    _sessions.reset(session["sid"])
+    # Discard now (not only on the reload), then reload into a fresh session.
+    _discard_session(session)
     return Response(headers={"HX-Redirect": "/"})
 
 

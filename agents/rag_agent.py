@@ -7,14 +7,15 @@ Graph topology:
           │
        retriever  ◄──────────────────────┐
           │                              │ (empty / insufficient)
-          ├─ sufficient ──► reranker     │
+          ├─ sufficient ──► context_builder
           └─ empty/insufficient ─────────┘ (max 2 retries)
-                                │
-                         context_builder
                                 │
                             generator
                                 │
                               END
+
+The retriever fuses hybrid-search results across the expanded sub-queries and
+hands the top `context_top_n` chunks straight to the context builder.
 
 LangGraph concepts demonstrated:
   - StateGraph with typed AgentState
@@ -27,7 +28,6 @@ from agents.state import AgentState
 from agents.nodes import (
     query_analyzer,
     retriever,
-    reranker,
     context_builder,
     generator,
 )
@@ -43,51 +43,36 @@ def _route_after_retrieval(state: AgentState) -> str:
         return "retriever"              # re-run with expanded queries
     if state.get("error"):
         return END
-    return "reranker"
-
-
-def _route_after_rerank(state: AgentState) -> str:
-    if state.get("error"):
-        return END
     return "context_builder"
 
 
-def build_rag_graph() -> StateGraph:
-    graph = StateGraph(AgentState)
-
+def _add_retrieval_nodes(graph: StateGraph) -> None:
+    """Nodes + routing shared by both graphs, up to and including context_builder."""
     graph.add_node("query_analyzer",  query_analyzer.run)
     graph.add_node("retriever",       retriever.run)
-    graph.add_node("reranker",        reranker.run)
     graph.add_node("context_builder", context_builder.run)
-    graph.add_node("generator",       generator.run)
 
     graph.set_entry_point("query_analyzer")
-
     graph.add_edge("query_analyzer", "retriever")
 
     graph.add_conditional_edges(
         "retriever",
         _route_after_retrieval,
         {
-            "query_analyzer": "query_analyzer",
-            "retriever":      "retriever",
-            "reranker":       "reranker",
-            END:              END,
-        },
-    )
-
-    graph.add_conditional_edges(
-        "reranker",
-        _route_after_rerank,
-        {
+            "query_analyzer":  "query_analyzer",
+            "retriever":       "retriever",
             "context_builder": "context_builder",
             END:               END,
         },
     )
 
+
+def build_rag_graph() -> StateGraph:
+    graph = StateGraph(AgentState)
+    _add_retrieval_nodes(graph)
+    graph.add_node("generator", generator.run)
     graph.add_edge("context_builder", "generator")
     graph.add_edge("generator",       END)
-
     return graph.compile()
 
 
@@ -97,35 +82,8 @@ def build_context_graph() -> StateGraph:
     window + citations, then generation is streamed token-by-token outside the
     graph. Reuses the exact same nodes and retry routing."""
     graph = StateGraph(AgentState)
-
-    graph.add_node("query_analyzer",  query_analyzer.run)
-    graph.add_node("retriever",       retriever.run)
-    graph.add_node("reranker",        reranker.run)
-    graph.add_node("context_builder", context_builder.run)
-
-    graph.set_entry_point("query_analyzer")
-    graph.add_edge("query_analyzer", "retriever")
-
-    graph.add_conditional_edges(
-        "retriever",
-        _route_after_retrieval,
-        {
-            "query_analyzer": "query_analyzer",
-            "retriever":      "retriever",
-            "reranker":       "reranker",
-            END:              END,
-        },
-    )
-    graph.add_conditional_edges(
-        "reranker",
-        _route_after_rerank,
-        {
-            "context_builder": "context_builder",
-            END:               END,
-        },
-    )
+    _add_retrieval_nodes(graph)
     graph.add_edge("context_builder", END)
-
     return graph.compile()
 
 
